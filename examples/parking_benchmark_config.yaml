@@ -1,0 +1,27 @@
+static_cars:
+  - stall: [bottom_left, bottom, 0]
+  - stall: [bottom_left, bottom, 2]
+  - stall: [bottom_left, bottom, 4]
+  - stall: [bottom_right, bottom, 1]
+  - stall: [bottom_right, bottom, 3]
+  - stall: [bottom_right, bottom, 5]
+  - stall: [top_left, top, 0]
+  - stall: [top_left, top, 2]
+  - stall: [top_left, top, 4]
+  - stall: [top_right, top, 1]
+  - stall: [top_right, top, 3]
+  - stall: [top_right, top, 5]
+
+agents:
+  - id: 0
+    start: [13.525, 2.094, 0.0]
+    goal_stall: [top_right, bottom, 2]
+  - id: 1
+    start: [13.525, 44.044, 0.0]
+    goal_stall: [bottom_right, top, 2]
+  - id: 2
+    start: [51.115, 6.281, 3.14159]
+    goal_stall: [top_left, bottom, 3]
+  - id: 3
+    start: [51.115, 48.231, 3.14159]
+    goal_stall: [bottom_left, top, 3]

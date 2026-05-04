@@ -1,0 +1,7 @@
+grid_cols: 2
+grid_rows: 2
+stalls_per_side: 6
+stall_width: 3.35
+stall_depth: 6.3
+zone_gap: 8.375
+perimeter_gap: 8.375

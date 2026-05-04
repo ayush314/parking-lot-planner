@@ -1,0 +1,14 @@
+.venv/
+build/
+__pycache__/
+*.pyc
+output.json
+lot.png
+*_output.json
+*.png
+*.gif
+batch/
+parking_benchmark_output.json
+!docs/
+!docs/*.png
+!docs/*.gif
