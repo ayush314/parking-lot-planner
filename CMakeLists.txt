@@ -25,6 +25,7 @@ add_library(
   parking_lot_core
   src/planner.cpp
   src/geometry.cpp
+  src/sipp.cpp
   src/io.cpp
 )
 
