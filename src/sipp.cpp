@@ -212,6 +212,29 @@ bool goalReached(
          angleDifference(pose.yaw, goal.yaw) <= planner_config.goal_yaw_tolerance;
 }
 
+// Check that the goal pose is collision-free at every integer time step from
+// arrival_time to max_time_steps. This matches HybridAStarPlanner's
+// primitiveKeepsGoalSafe semantics exactly, and avoids the pre-computed
+// safe-interval check (cur_interval.hi >= max_time_steps) which fails whenever
+// a prior agent transiently crosses the goal cell: that transient crossing
+// splits the goal cell's safe interval so no single interval reaches
+// max_time_steps, even though the goal is perfectly clear at the actual
+// arrival time and from then on.
+bool goalIsClearFromArrival(
+    const Pose& goal_pose,
+    int arrival_time,
+    const Instance& instance,
+    const CollisionChecker& checker,
+    const std::vector<Trajectory>& dynamic_obstacles,
+    const ConstraintSet& constraints) {
+  for (int t = arrival_time; t <= instance.vehicle.max_time_steps; ++t) {
+    if (checker.collides(goal_pose, dynamic_obstacles, constraints, t)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Pose integrateMotion(
     const Pose& pose,
     int direction,
@@ -709,11 +732,26 @@ PlanResult SippPlanner::plan(
         intervals.intervals(current_cell);
     const SafeInterval cur_interval = cur_intervals[current.interval_index];
 
-    // Goal check: the agent has reached the goal pose AND the safe interval
-    // at the goal extends to the end of the planning horizon, meaning no
-    // future obstacle will displace the agent from its parking spot.
+    // Goal check: the agent has reached the goal pose AND the goal is
+    // collision-free from arrival_time to max_time_steps (i.e. no future
+    // obstacle will displace the agent from its parking spot).
+    //
+    // FIX (transient-crossing bug): the previous check used
+    //   cur_interval.hi >= max_time_steps
+    // which fails when any prior agent transiently crosses the goal cell.
+    // That crossing splits the pre-computed safe interval, so even though
+    // the goal is completely clear at the actual arrival time, no interval
+    // reaches max_time_steps and the goal check never fires.
+    // goalIsClearFromArrival does a direct forward scan from arrival_time,
+    // matching HybridAStarPlanner::primitiveKeepsGoalSafe exactly.
     if (goalReached(current.pose, goal, planner_config) &&
-        cur_interval.hi >= instance.vehicle.max_time_steps) {
+        goalIsClearFromArrival(
+            current.pose,
+            current.arrival_time,
+            instance,
+            checker,
+            dynamic_obstacles,
+            constraints)) {
       return finalizePlanResult(
           true,
           reconstructTrajectory(nodes, current_entry.node_index),
