@@ -416,16 +416,37 @@ class SafeIntervalTable {
     }
   }
 
-  const std::vector<SafeInterval>& intervals(const CellKey& key) {
+  // Query safe intervals for a cell.
+  //
+  // We always try the canonical cell-centre pose first (guarantees a
+  // path-independent, consistent cache entry). If the centre happens to be
+  // inside a static obstacle — which occurs at parked-car boundaries where
+  // the quantised cell straddles the footprint — we fall back to actual_pose,
+  // the real continuous pose the search arrived at. This prevents permanently
+  // blocking cells that are geometrically reachable; it only changes the
+  // static-collision test, never the dynamic-obstacle sweep (which uses the
+  // same pose either way, and is correct because we pass actual_pose there too).
+  //
+  // Note: two different actual_poses for the same key could produce different
+  // results when the centre is blocked, so the cache stores the first non-empty
+  // result and reuses it. In practice the continuous poses landing in the same
+  // cell are spatially close, so this is safe.
+  const std::vector<SafeInterval>& intervals(
+      const CellKey& key, const Pose& actual_pose) {
     auto it = cache_.find(key);
     if (it != cache_.end()) {
       return it->second;
     }
-    // FIX: compute using the canonical cell-centre pose, not a caller-supplied
-    // continuous pose. This eliminates the cache-poisoning bug where the first
-    // path to visit a cell boundary would permanently mark it as blocked.
     const Pose centre = cellCentrePose(key, instance_);
-    return cache_.emplace(key, compute(centre)).first->second;
+    std::vector<SafeInterval> result = compute(centre);
+    // If the cell centre is in static collision but the actual traversal pose
+    // is free, recompute using the actual pose. This handles boundary cells
+    // where the centre straddles a parked car but the real path through the
+    // cell is clear.
+    if (result.empty() && !checker_.collides(actual_pose)) {
+      result = compute(actual_pose);
+    }
+    return cache_.emplace(key, std::move(result)).first->second;
   }
 
  private:
@@ -683,7 +704,7 @@ PlanResult SippPlanner::plan(
 
   const CellKey start_cell = makeCellKey(start, instance);
   const std::vector<SafeInterval>& start_intervals =
-      intervals.intervals(start_cell);
+      intervals.intervals(start_cell, start);
   const int start_interval_index = findIntervalIndex(start_intervals, 0);
   if (start_interval_index < 0) {
     return fail("start pose has no safe interval at t=0");
@@ -727,9 +748,8 @@ PlanResult SippPlanner::plan(
       continue;
     }
 
-    // FIX: query by CellKey only — the table uses cell-centre poses internally.
     const std::vector<SafeInterval>& cur_intervals =
-        intervals.intervals(current_cell);
+        intervals.intervals(current_cell, current.pose);
     const SafeInterval cur_interval = cur_intervals[current.interval_index];
 
     // Goal check: the agent has reached the goal pose AND the goal is
@@ -775,9 +795,20 @@ PlanResult SippPlanner::plan(
           primitive.steer,
           instance.vehicle,
           instance.vehicle.step_size);
+
+      // Static collision check on the actual successor pose, matching
+      // HybridAStarPlanner's own successor filtering. This must happen
+      // before querying the interval table: without it, the fallback path
+      // in SafeIntervalTable::intervals() (centre blocked → use actual_pose)
+      // would compute intervals for poses that are genuinely in collision,
+      // creating phantom free cells and exploding the search space.
+      if (checker.collides(next_pose)) {
+        continue;
+      }
+
       const CellKey next_cell = makeCellKey(next_pose, instance);
       const std::vector<SafeInterval>& next_intervals =
-          intervals.intervals(next_cell);
+          intervals.intervals(next_cell, next_pose);
 
       for (std::size_t k = 0; k < next_intervals.size(); ++k) {
         const SafeInterval& next_interval = next_intervals[k];
