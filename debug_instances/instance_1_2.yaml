@@ -1,0 +1,89 @@
+map:
+  width: 65.325
+  height: 50.325
+  resolution: 0.5
+vehicle:
+  length: 4.77
+  width: 1.86
+  min_turning_radius: 5.5
+  step_size: 0.5
+  heading_bins: 72
+  max_time_steps: 260
+planner:
+  goal_position_tolerance: 0.25
+  goal_yaw_tolerance: 0.12
+  max_expansions: 750000
+parking_layout:
+  grid_cols: 2
+  grid_rows: 2
+  stalls_per_side: 6
+  stall_width: 3.35
+  stall_depth: 6.3
+  zone_gap: 8.375
+  perimeter_gap: 8.375
+static_cars:
+- id: s0
+  pose:
+  - 10.05
+  - 11.525
+  - 1.5708
+- id: s1
+  pose:
+  - 16.75
+  - 11.525
+  - 1.5708
+- id: s2
+  pose:
+  - 23.45
+  - 11.525
+  - 1.5708
+- id: s3
+  pose:
+  - 41.875
+  - 11.525
+  - 1.5708
+- id: s4
+  pose:
+  - 48.575
+  - 11.525
+  - 1.5708
+- id: s5
+  pose:
+  - 55.275
+  - 11.525
+  - 1.5708
+- id: s6
+  pose:
+  - 10.05
+  - 38.8
+  - -1.5708
+- id: s7
+  pose:
+  - 16.75
+  - 38.8
+  - -1.5708
+- id: s8
+  pose:
+  - 23.45
+  - 38.8
+  - -1.5708
+- id: s9
+  pose:
+  - 41.875
+  - 38.8
+  - -1.5708
+- id: s10
+  pose:
+  - 48.575
+  - 38.8
+  - -1.5708
+- id: s11
+  pose:
+  - 55.275
+  - 38.8
+  - -1.5708
+
+agents:
+  - id: "2"
+    start: [51.115, 6.281, 3.14159]
+    goal: [20.1, 32.5, 1.5708]

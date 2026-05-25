@@ -464,7 +464,8 @@ def main() -> int:
     for pl in planners:
         summary[pl] = {}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    tmpdir = os.path.abspath("debug_instances"); os.makedirs(tmpdir, exist_ok=True)
+    if True:
         # Generate the base flat instance first — we read the agent pool
         # from it so we always use the schema the planner actually expects
         # (start/goal), regardless of what keys the raw config uses.

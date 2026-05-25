@@ -96,21 +96,52 @@ struct CellKeyHash {
 struct StateKey {
   CellKey cell;
   int interval_index = 0;
+  // Fine-pose bins: a second, finer quantization of the continuous pose. Two
+  // search nodes share a StateKey only if they land in the same search cell,
+  // the same safe interval, AND the same fine-pose bin -- making dominance an
+  // exact, transitive equivalence rather than a non-convergent proximity test.
+  int fine_x = 0;
+  int fine_y = 0;
+  int fine_yaw = 0;
 
   bool operator==(const StateKey& other) const {
-    return cell == other.cell && interval_index == other.interval_index;
+    return cell == other.cell && interval_index == other.interval_index &&
+           fine_x == other.fine_x && fine_y == other.fine_y &&
+           fine_yaw == other.fine_yaw;
   }
 };
 
 struct StateKeyHash {
   std::size_t operator()(const StateKey& key) const {
     std::size_t seed = CellKeyHash{}(key.cell);
-    seed ^= static_cast<std::size_t>(
-                static_cast<unsigned int>(key.interval_index)) +
-            0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+    auto mix = [&](int value) {
+      seed ^= static_cast<std::size_t>(static_cast<unsigned int>(value)) +
+              0x9e3779b9U + (seed << 6U) + (seed >> 2U);
+    };
+    mix(key.interval_index);
+    mix(key.fine_x);
+    mix(key.fine_y);
+    mix(key.fine_yaw);
     return seed;
   }
 };
+
+// Fine-pose dominance key.
+//
+// The search cell (x,y at 0.5 m, yaw at 5 deg) is too coarse to be a sound
+// dominance key: kinematically distinct poses collapse onto one cell and the
+// earliest-arrival rule then discards a pose a later maneuver needs. The fix
+// is a SECOND, finer quantization used purely for dominance: snap the pose to
+// a fine grid and treat (cell, interval, fine-pose-bin) as the state. This is
+// an exact, transitive equivalence (unlike a tolerance test, which is not
+// transitive and so never converges -- it lets a chain of pairwise-close
+// poses accumulate without bound). One label per fine bin.
+//
+// The fine resolution is chosen finer than the search cell so genuinely
+// distinct poses stay separate, but coarse enough to still merge the
+// near-identical poses different primitive sequences produce.
+constexpr double kFinePositionRes = 0.35;  // metres
+constexpr double kFineYawRes = 0.06;       // radians (~3.4 deg)
 
 // ---------------------------------------------------------------------------
 // Search node.
@@ -168,6 +199,27 @@ double distance(const Pose& lhs, const Pose& rhs) {
   const double dx = lhs.x - rhs.x;
   const double dy = lhs.y - rhs.y;
   return std::sqrt(dx * dx + dy * dy);
+}
+
+// Builds the full dominance key for a pose: the search cell, the safe-interval
+// index, and the fine-pose bin. Two nodes with equal StateKey are exact
+// duplicates for dominance purposes; the earlier arrival dominates.
+StateKey makeStateKey(
+    const Pose& pose, const CellKey& cell, int interval_index) {
+  StateKey key;
+  key.cell = cell;
+  key.interval_index = interval_index;
+  key.fine_x = static_cast<int>(std::llround(pose.x / kFinePositionRes));
+  key.fine_y = static_cast<int>(std::llround(pose.y / kFinePositionRes));
+  double wrapped = pose.yaw;
+  while (wrapped < 0.0) {
+    wrapped += kTwoPi;
+  }
+  while (wrapped >= kTwoPi) {
+    wrapped -= kTwoPi;
+  }
+  key.fine_yaw = static_cast<int>(std::llround(wrapped / kFineYawRes));
+  return key;
 }
 
 // Heuristic in time-step units: a straight-line dash at one step_size per
@@ -773,8 +825,12 @@ PlanResult SippPlanner::plan(
   std::vector<SearchNode> nodes;
   nodes.reserve(kSearchReserveHint);
 
-  // best_costs maps (cell, interval) -> best known arrival time (integer).
-  // Integer keys make the dominance check exact.
+  // best_costs maps each dominance state -- (cell, interval, fine-pose-bin) --
+  // to the best (earliest) arrival time settled for it. Because the fine-pose
+  // bin is part of the key, two kinematically distinct poses in the same
+  // search cell occupy different entries and neither is pruned by the other;
+  // within a single fine bin, where poses are interchangeable, the earliest
+  // arrival dominates. Integer arrival times make the check exact.
   std::unordered_map<StateKey, int, StateKeyHash> best_costs;
   best_costs.reserve(kSearchReserveHint);
 
@@ -788,19 +844,22 @@ PlanResult SippPlanner::plan(
       -1,                    // parent_index
   });
   open.push(OpenEntry{start_h, 0, 0});
-  best_costs.emplace(StateKey{start_cell, start_interval_index}, 0);
+  best_costs.emplace(
+      makeStateKey(start, start_cell, start_interval_index), 0);
 
   while (!open.empty()) {
     const OpenEntry current_entry = open.top();
     open.pop();
 
     const SearchNode current = nodes[current_entry.node_index];
-    const StateKey current_key{current.cell, current.interval_index};
+    const StateKey current_key =
+        makeStateKey(current.pose, current.cell, current.interval_index);
 
-    // Stale-node check: skip if a strictly better path to this (cell,
-    // interval) was already settled.
+    // Stale-node check: skip if a strictly better path to this exact state
+    // (same cell, interval, AND fine-pose bin) was already settled.
     const auto best_it = best_costs.find(current_key);
-    if (best_it == best_costs.end() || current.arrival_time > best_it->second) {
+    if (best_it == best_costs.end() ||
+        current.arrival_time > best_it->second) {
       continue;
     }
 
@@ -896,7 +955,12 @@ PlanResult SippPlanner::plan(
         }
 
         const int arrival = depart + 1;
-        const StateKey next_key{next_cell, static_cast<int>(k)};
+        const StateKey next_key =
+            makeStateKey(next_pose, next_cell, static_cast<int>(k));
+
+        // Dominance: skip the successor if an equal-or-better arrival is
+        // already recorded for this exact state (cell, interval, fine-pose
+        // bin). Otherwise relax the state and push the node.
         const auto existing = best_costs.find(next_key);
         if (existing != best_costs.end() && arrival >= existing->second) {
           continue;
