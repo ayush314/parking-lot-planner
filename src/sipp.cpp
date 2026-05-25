@@ -12,16 +12,32 @@ namespace parking_lot_planner {
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kTwoPi = 2.0 * kPi;
 constexpr double kStateResolutionFloor = 1e-3;
 constexpr double kCurvatureEpsilon = 1e-9;
-constexpr double kCostEpsilon = 1e-9;
 constexpr double kDefaultCollisionCheckResolutionMin = 0.1;
 constexpr double kDefaultCollisionCheckMapScale = 0.5;
 constexpr int kDefaultMaxExpansions = 200000;
 constexpr int kMinPrimitiveSamples = 2;
 constexpr std::size_t kSearchReserveHint = 8192;
+
+// ---------------------------------------------------------------------------
+// Motion primitives
+//
+// Six kinematic primitives (3 steer angles x 2 directions). Note: SIPP does
+// NOT need an explicit "wait" primitive the way Hybrid A* does. Waiting is
+// expressed implicitly by the departure-time search inside each safe interval:
+// a single successor node represents "arrive in interval k as early as
+// possible", which already accounts for any amount of waiting in the current
+// cell. This is the structural reason SIPP expands far fewer states than
+// Hybrid A* on long horizons -- one node per (cell, interval) rather than one
+// node per (cell, timestep).
+// ---------------------------------------------------------------------------
 
 struct Primitive {
   int direction = 0;
@@ -37,10 +53,20 @@ constexpr std::array<Primitive, 6> kPrimitives = {{
     Primitive{-1, 1},
 }};
 
+// ---------------------------------------------------------------------------
+// Safe interval: an inclusive [lo, hi] window of integer time steps during
+// which a cell is free of dynamic obstacles and time-point constraints.
+// ---------------------------------------------------------------------------
+
 struct SafeInterval {
   int lo = 0;
   int hi = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Cell key: the discretized (x, y, yaw) configuration. This is the spatial
+// state. The full SIPP state is (cell, interval_index).
+// ---------------------------------------------------------------------------
 
 struct CellKey {
   int x_bin = 0;
@@ -57,8 +83,8 @@ struct CellKeyHash {
   std::size_t operator()(const CellKey& key) const {
     std::size_t seed = 0;
     auto mix = [&](int value) {
-      seed ^= static_cast<std::size_t>(value) + 0x9e3779b9U + (seed << 6U) +
-              (seed >> 2U);
+      seed ^= static_cast<std::size_t>(static_cast<unsigned int>(value)) +
+              0x9e3779b9U + (seed << 6U) + (seed >> 2U);
     };
     mix(key.x_bin);
     mix(key.y_bin);
@@ -79,34 +105,50 @@ struct StateKey {
 struct StateKeyHash {
   std::size_t operator()(const StateKey& key) const {
     std::size_t seed = CellKeyHash{}(key.cell);
-    seed ^= static_cast<std::size_t>(key.interval_index) + 0x9e3779b9U +
-            (seed << 6U) + (seed >> 2U);
+    seed ^= static_cast<std::size_t>(
+                static_cast<unsigned int>(key.interval_index)) +
+            0x9e3779b9U + (seed << 6U) + (seed >> 2U);
     return seed;
   }
 };
 
-// g_cost is stored as arrival_time (integer steps). This keeps g and h in the
-// same units (steps and steps-to-goal) so the heuristic is consistent and the
-// search priority is well-calibrated.
+// ---------------------------------------------------------------------------
+// Search node.
+//
+// g_cost is stored as arrival_time (integer time steps). Keeping g and h in
+// the same units (time steps) makes f = g + h consistent and the dominance
+// check exact (no floating-point ambiguity).
+// ---------------------------------------------------------------------------
+
 struct SearchNode {
   Pose pose;
   int arrival_time = 0;
   int interval_index = 0;
-  int g_cost = 0;      // == arrival_time; kept separate for clarity
+  CellKey cell;
   double f_cost = 0.0;
   int parent_index = -1;
 };
 
 struct OpenEntry {
   double f_cost = 0.0;
+  int arrival_time = 0;  // tie-breaker: prefer earlier arrival (smaller makespan)
   int node_index = -1;
 };
 
 struct OpenCompare {
   bool operator()(const OpenEntry& lhs, const OpenEntry& rhs) const {
-    return lhs.f_cost > rhs.f_cost;
+    if (lhs.f_cost != rhs.f_cost) {
+      return lhs.f_cost > rhs.f_cost;
+    }
+    // Tie-break toward earlier arrival. This nudges the search toward lower
+    // makespan solutions when multiple paths have equal f.
+    return lhs.arrival_time > rhs.arrival_time;
   }
 };
+
+// ---------------------------------------------------------------------------
+// Angle / geometry helpers
+// ---------------------------------------------------------------------------
 
 double normalizeAngle(double angle) {
   while (angle >= kPi) {
@@ -128,16 +170,14 @@ double distance(const Pose& lhs, const Pose& rhs) {
   return std::sqrt(dx * dx + dy * dy);
 }
 
-// FIX (BUG 3 / performance): heuristic is now in the same units as g_cost
-// (time steps). h = Euclidean distance / step_size is an admissible lower
-// bound on the number of steps remaining, keeping f = g + h consistent.
+// Heuristic in time-step units: a straight-line dash at one step_size per
+// step is an admissible lower bound on the number of steps remaining, so
+// f = g + h stays consistent with g (also in time-step units).
 double heuristic(const Pose& pose, const Pose& goal, double step_size) {
   return distance(pose, goal) / step_size;
 }
 
-bool isConfigured(double value) {
-  return !std::isnan(value);
-}
+bool isConfigured(double value) { return !std::isnan(value); }
 
 PlannerConfig resolvePlannerConfig(const Instance& instance) {
   PlannerConfig config = instance.planner;
@@ -185,25 +225,6 @@ CellKey makeCellKey(const Pose& pose, const Instance& instance) {
   };
 }
 
-// FIX (BUG 1 — cache poisoning): return the canonical centre pose for a cell.
-// The SafeIntervalTable must evaluate static collision at a single representative
-// pose per cell. Using the continuous pose that first happens to visit a cell is
-// wrong: if that pose straddles a parked-car boundary it will be "in collision",
-// the cell will be cached as permanently blocked, and every later query for the
-// same cell key (including queries from genuinely free poses) returns empty
-// intervals. Using the cell-centre pose is the correct canonical choice —
-// it is the same pose regardless of which search path first visits this cell.
-Pose cellCentrePose(const CellKey& key, const Instance& instance) {
-  const double res = cellResolution(instance);
-  const double bin_size = kTwoPi / static_cast<double>(instance.vehicle.heading_bins);
-  const double yaw = static_cast<double>(key.yaw_bin) * bin_size;
-  return Pose{
-      static_cast<double>(key.x_bin) * res,
-      static_cast<double>(key.y_bin) * res,
-      normalizeAngle(yaw),
-  };
-}
-
 bool goalReached(
     const Pose& pose,
     const Pose& goal,
@@ -212,28 +233,11 @@ bool goalReached(
          angleDifference(pose.yaw, goal.yaw) <= planner_config.goal_yaw_tolerance;
 }
 
-// Check that the goal pose is collision-free at every integer time step from
-// arrival_time to max_time_steps. This matches HybridAStarPlanner's
-// primitiveKeepsGoalSafe semantics exactly, and avoids the pre-computed
-// safe-interval check (cur_interval.hi >= max_time_steps) which fails whenever
-// a prior agent transiently crosses the goal cell: that transient crossing
-// splits the goal cell's safe interval so no single interval reaches
-// max_time_steps, even though the goal is perfectly clear at the actual
-// arrival time and from then on.
-bool goalIsClearFromArrival(
-    const Pose& goal_pose,
-    int arrival_time,
-    const Instance& instance,
-    const CollisionChecker& checker,
-    const std::vector<Trajectory>& dynamic_obstacles,
-    const ConstraintSet& constraints) {
-  for (int t = arrival_time; t <= instance.vehicle.max_time_steps; ++t) {
-    if (checker.collides(goal_pose, dynamic_obstacles, constraints, t)) {
-      return false;
-    }
-  }
-  return true;
-}
+// ---------------------------------------------------------------------------
+// Kinematic integration (constant-curvature arc), identical to the Hybrid A*
+// baseline so that the two planners explore the same continuous state space
+// and the comparison is apples-to-apples.
+// ---------------------------------------------------------------------------
 
 Pose integrateMotion(
     const Pose& pose,
@@ -241,9 +245,9 @@ Pose integrateMotion(
     int steer,
     const VehicleParams& vehicle,
     double travel) {
-  const double curvature = steer == 0 ? 0.0
-                                      : static_cast<double>(steer) /
-                                            vehicle.min_turning_radius;
+  const double curvature =
+      steer == 0 ? 0.0
+                 : static_cast<double>(steer) / vehicle.min_turning_radius;
   const double delta_yaw = static_cast<double>(direction) * curvature * travel;
 
   Pose next = pose;
@@ -266,17 +270,10 @@ Pose integratePrimitive(
     const VehicleParams& vehicle,
     double fraction) {
   return integrateMotion(
-      pose,
-      direction,
-      steer,
-      vehicle,
-      vehicle.step_size * fraction);
+      pose, direction, steer, vehicle, vehicle.step_size * fraction);
 }
 
-Pose interpolatePose(
-    const Pose& start,
-    const Pose& end,
-    double fraction) {
+Pose interpolatePose(const Pose& start, const Pose& end, double fraction) {
   return Pose{
       start.x + (end.x - start.x) * fraction,
       start.y + (end.y - start.y) * fraction,
@@ -284,9 +281,10 @@ Pose interpolatePose(
   };
 }
 
+// Obstacle pose at a continuous time (linear interpolation between the
+// integer-time trajectory points), used for sub-step swept collision checks.
 Pose trajectoryPoseAtContinuousTime(
-    const Trajectory& trajectory,
-    double time_step) {
+    const Trajectory& trajectory, double time_step) {
   if (trajectory.empty()) {
     return Pose{};
   }
@@ -298,7 +296,7 @@ Pose trajectoryPoseAtContinuousTime(
     const TrajectoryPoint& current = trajectory[i];
     if (time_step <= static_cast<double>(current.t)) {
       const double duration = static_cast<double>(current.t - previous.t);
-      if (duration <= kCostEpsilon) {
+      if (duration <= 1e-9) {
         return current.pose;
       }
       const double fraction =
@@ -307,15 +305,6 @@ Pose trajectoryPoseAtContinuousTime(
     }
   }
   return trajectory.back().pose;
-}
-
-int primitiveSampleCount(
-    const Instance& instance,
-    const PlannerConfig& planner_config) {
-  return std::max(
-      kMinPrimitiveSamples,
-      static_cast<int>(std::ceil(
-          instance.vehicle.step_size / planner_config.collision_check_resolution)));
 }
 
 Pose poseAtIntegerTime(const Trajectory& trajectory, int time_step) {
@@ -328,6 +317,13 @@ Pose poseAtIntegerTime(const Trajectory& trajectory, int time_step) {
   if (time_step >= trajectory.back().t) {
     return trajectory.back().pose;
   }
+  // Trajectories are densified to one point per step, so a direct probe by
+  // offset is exact; fall back to a scan if that assumption ever breaks.
+  const int offset = time_step - trajectory.front().t;
+  if (offset >= 0 && offset < static_cast<int>(trajectory.size()) &&
+      trajectory[offset].t == time_step) {
+    return trajectory[offset].pose;
+  }
   for (const TrajectoryPoint& point : trajectory) {
     if (point.t == time_step) {
       return point.pose;
@@ -336,9 +332,24 @@ Pose poseAtIntegerTime(const Trajectory& trajectory, int time_step) {
   return trajectory.back().pose;
 }
 
-// Precomputed obstacle pose snapshots indexed by integer time.
+int primitiveSampleCount(
+    const Instance& instance, const PlannerConfig& planner_config) {
+  return std::max(
+      kMinPrimitiveSamples,
+      static_cast<int>(std::ceil(
+          instance.vehicle.step_size /
+          planner_config.collision_check_resolution)));
+}
+
+// ---------------------------------------------------------------------------
+// Precomputed obstacle snapshots, indexed by integer time. Each snapshot also
+// carries a squared cull distance so the per-time sweep can skip obstacles
+// that are obviously too far to overlap before doing the exact SAT check.
+// ---------------------------------------------------------------------------
+
 struct ObstacleSnapshot {
   std::vector<Pose> poses;
+  bool active = false;
   double cull_distance_sq = 0.0;
 };
 
@@ -347,16 +358,20 @@ std::vector<ObstacleSnapshot> buildObstacleSnapshots(
     const std::vector<Trajectory>& dynamic_obstacles) {
   const double half_length = 0.5 * instance.vehicle.length;
   const double half_width = 0.5 * instance.vehicle.width;
+  // Two vehicle diagonals plus a small margin: a safe upper bound on the
+  // centre-to-centre distance at which two footprints can possibly overlap.
   const double cull_radius =
       2.0 * std::sqrt(half_length * half_length + half_width * half_width) +
       1.0;
+
   std::vector<ObstacleSnapshot> snapshots;
   snapshots.reserve(dynamic_obstacles.size());
   for (const Trajectory& trajectory : dynamic_obstacles) {
     ObstacleSnapshot snapshot;
     snapshot.cull_distance_sq = cull_radius * cull_radius;
-    snapshot.poses.resize(instance.vehicle.max_time_steps + 1);
-    if (!trajectory.empty()) {
+    snapshot.active = !trajectory.empty();
+    if (snapshot.active) {
+      snapshot.poses.resize(instance.vehicle.max_time_steps + 1);
       for (int t = 0; t <= instance.vehicle.max_time_steps; ++t) {
         snapshot.poses[t] = poseAtIntegerTime(trajectory, t);
       }
@@ -367,8 +382,7 @@ std::vector<ObstacleSnapshot> buildObstacleSnapshots(
 }
 
 std::vector<std::vector<const Constraint*>> bucketConstraintsByTime(
-    const ConstraintSet& constraints,
-    int max_time_steps) {
+    const ConstraintSet& constraints, int max_time_steps) {
   std::vector<std::vector<const Constraint*>> buckets(max_time_steps + 1);
   for (const Constraint& constraint : constraints) {
     if (constraint.time_step >= 0 && constraint.time_step <= max_time_steps) {
@@ -378,20 +392,34 @@ std::vector<std::vector<const Constraint*>> bucketConstraintsByTime(
   return buckets;
 }
 
-// Lazily computes and caches safe intervals per discretized pose cell.
+// ---------------------------------------------------------------------------
+// SafeIntervalTable
 //
-// FIX (BUG 1 — cache poisoning): intervals are now computed from the canonical
-// cell-centre pose rather than the first continuous pose that happens to visit
-// this cell. This guarantees a consistent, path-independent result: two search
-// paths that reach the same discretised cell always see the same interval list,
-// regardless of which continuous pose each path arrived at.
+// Lazily computes and caches the safe intervals of each discretized cell.
 //
-// FIX (BUG 5 — dead short-circuit): the original code checked
-// `constraints_by_time_.empty()`, but that outer vector always has size
-// max_time_steps+1 (one bucket per step), so .empty() is always false. The fix
-// tracks whether any non-empty bucket exists via a boolean flag set at
-// construction time, enabling the O(1) short-circuit when there are truly no
-// dynamic obstacles or constraints.
+// DESIGN (the core of this rewrite):
+//
+//   The table answers exactly ONE question: "if the vehicle footprint sits
+//   at this cell, during which integer-time windows is it free of dynamic
+//   obstacles and time-point constraints?" It does NOT decide whether an
+//   edge can be traversed -- that is the sole job of the swept-pose primitive
+//   check in transitionIsSafe(). The previous implementation let the table
+//   and the swept check both judge collision, and they could disagree;
+//   here each concern has exactly one owner.
+//
+//   Intervals are keyed on the cell and computed from the FIRST actual pose
+//   that reaches that cell. There is no synthetic "cell-centre pose". At the
+//   benchmark resolution (0.5 m, 72 heading bins => 5 deg) any two poses that
+//   quantize to the same cell are within ~0.35 m and ~2.5 deg of each other;
+//   for a 4.77 m x 1.86 m vehicle the resulting footprint difference is
+//   negligible, so caching by cell is sound and -- because the computing pose
+//   is a real, free pose the search actually visited -- there is no cache
+//   poisoning.
+//
+//   When the environment is fully static the whole cell is trivially one
+//   interval [0, max_time_steps]; the per-time sweep is skipped entirely.
+// ---------------------------------------------------------------------------
+
 class SafeIntervalTable {
  public:
   SafeIntervalTable(
@@ -403,9 +431,12 @@ class SafeIntervalTable {
         checker_(checker),
         obstacle_snapshots_(obstacle_snapshots),
         constraints_by_time_(constraints_by_time) {
-    // Precompute whether any dynamic information exists so the inner sweep
-    // can be skipped entirely when the environment is static.
-    has_dynamic_info_ = !obstacle_snapshots_.empty();
+    for (const ObstacleSnapshot& snapshot : obstacle_snapshots_) {
+      if (snapshot.active) {
+        has_dynamic_info_ = true;
+        break;
+      }
+    }
     if (!has_dynamic_info_) {
       for (const auto& bucket : constraints_by_time_) {
         if (!bucket.empty()) {
@@ -416,54 +447,35 @@ class SafeIntervalTable {
     }
   }
 
-  // Query safe intervals for a cell.
-  //
-  // We always try the canonical cell-centre pose first (guarantees a
-  // path-independent, consistent cache entry). If the centre happens to be
-  // inside a static obstacle — which occurs at parked-car boundaries where
-  // the quantised cell straddles the footprint — we fall back to actual_pose,
-  // the real continuous pose the search arrived at. This prevents permanently
-  // blocking cells that are geometrically reachable; it only changes the
-  // static-collision test, never the dynamic-obstacle sweep (which uses the
-  // same pose either way, and is correct because we pass actual_pose there too).
-  //
-  // Note: two different actual_poses for the same key could produce different
-  // results when the centre is blocked, so the cache stores the first non-empty
-  // result and reuses it. In practice the continuous poses landing in the same
-  // cell are spatially close, so this is safe.
+  // Returns the safe intervals for the cell that `pose` quantizes to. The
+  // result is computed once (from `pose`) and cached. A cell that is in
+  // static collision yields an empty interval list.
   const std::vector<SafeInterval>& intervals(
-      const CellKey& key, const Pose& actual_pose) {
+      const CellKey& key, const Pose& pose) {
     auto it = cache_.find(key);
     if (it != cache_.end()) {
       return it->second;
     }
-    const Pose centre = cellCentrePose(key, instance_);
-    std::vector<SafeInterval> result = compute(centre);
-    // If the cell centre is in static collision but the actual traversal pose
-    // is free, recompute using the actual pose. This handles boundary cells
-    // where the centre straddles a parked car but the real path through the
-    // cell is clear.
-    if (result.empty() && !checker_.collides(actual_pose)) {
-      result = compute(actual_pose);
-    }
-    return cache_.emplace(key, std::move(result)).first->second;
+    return cache_.emplace(key, compute(pose)).first->second;
   }
 
  private:
-  bool unsafeAtTime(const Pose& pose, int time_step) const {
+  // True iff `pose` is in collision with a dynamic obstacle or violates a
+  // time-point constraint at integer time `time_step`. Static geometry is
+  // intentionally NOT considered here -- it is handled once in compute().
+  bool dynamicallyUnsafeAt(const Pose& pose, int time_step) const {
     for (const Constraint* constraint : constraints_by_time_[time_step]) {
       const double dx = pose.x - constraint->pose.x;
       const double dy = pose.y - constraint->pose.y;
-      if (dx * dx + dy * dy <=
-              (constraint->position_tolerance + 1e-9) *
-                  (constraint->position_tolerance + 1e-9) &&
-          std::abs(normalizeAngle(pose.yaw - constraint->pose.yaw)) <=
+      const double tol = constraint->position_tolerance + 1e-9;
+      if (dx * dx + dy * dy <= tol * tol &&
+          angleDifference(pose.yaw, constraint->pose.yaw) <=
               constraint->yaw_tolerance + 1e-9) {
         return true;
       }
     }
     for (const ObstacleSnapshot& snapshot : obstacle_snapshots_) {
-      if (snapshot.poses.empty()) {
+      if (!snapshot.active) {
         continue;
       }
       const Pose& obstacle_pose = snapshot.poses[time_step];
@@ -481,18 +493,23 @@ class SafeIntervalTable {
 
   std::vector<SafeInterval> compute(const Pose& pose) const {
     std::vector<SafeInterval> result;
+
+    // Static obstacles never move: a statically-blocked cell is blocked for
+    // all time and has no safe interval.
     if (checker_.collides(pose)) {
-      return result;  // permanently blocked by static obstacle
+      return result;
     }
-    // FIX (BUG 5): use the precomputed flag instead of .empty() on the
-    // outer vector (which is always non-empty due to per-step buckets).
+
+    // Fully static environment: the entire horizon is one safe interval.
     if (!has_dynamic_info_) {
       result.push_back(SafeInterval{0, instance_.vehicle.max_time_steps});
       return result;
     }
+
+    // Sweep integer time, accumulating maximal runs of safe steps.
     int run_start = -1;
     for (int t = 0; t <= instance_.vehicle.max_time_steps; ++t) {
-      const bool safe = !unsafeAtTime(pose, t);
+      const bool safe = !dynamicallyUnsafeAt(pose, t);
       if (safe && run_start < 0) {
         run_start = t;
       } else if (!safe && run_start >= 0) {
@@ -501,7 +518,8 @@ class SafeIntervalTable {
       }
     }
     if (run_start >= 0) {
-      result.push_back(SafeInterval{run_start, instance_.vehicle.max_time_steps});
+      result.push_back(
+          SafeInterval{run_start, instance_.vehicle.max_time_steps});
     }
     return result;
   }
@@ -515,8 +533,7 @@ class SafeIntervalTable {
 };
 
 int findIntervalIndex(
-    const std::vector<SafeInterval>& intervals,
-    int time_step) {
+    const std::vector<SafeInterval>& intervals, int time_step) {
   for (std::size_t i = 0; i < intervals.size(); ++i) {
     if (time_step >= intervals[i].lo && time_step <= intervals[i].hi) {
       return static_cast<int>(i);
@@ -525,15 +542,21 @@ int findIntervalIndex(
   return -1;
 }
 
-// Check whether the motion from start_pose to end_pose, departing at depart_time
-// and arriving at depart_time+1, is free of static obstacles and dynamic obstacles.
-// The arrival pose is also checked against point constraints at arrival_time.
+// ---------------------------------------------------------------------------
+// Edge validity: the SINGLE authority on whether a motion can be executed.
+//
+// A primitive departs `start_pose` at integer time `depart_time` and arrives
+// at `end_pose` at `depart_time + 1`. The motion is valid iff every swept
+// sub-sample is free of static geometry AND free of every dynamic obstacle at
+// the matching continuous time, and the arrival pose satisfies the time-point
+// constraints at the arrival step.
+// ---------------------------------------------------------------------------
+
 bool transitionIsSafe(
     const Pose& start_pose,
     const Pose& end_pose,
     const Primitive& primitive,
     int depart_time,
-    int arrival_time,
     const Instance& instance,
     const PlannerConfig& planner_config,
     const CollisionChecker& checker,
@@ -552,96 +575,104 @@ bool transitionIsSafe(
     if (checker.collides(sample)) {
       return false;
     }
-    const double query_time =
-        static_cast<double>(depart_time) + fraction;
+    const double query_time = static_cast<double>(depart_time) + fraction;
     for (const Trajectory& obstacle : dynamic_obstacles) {
       if (obstacle.empty()) {
         continue;
       }
       if (checker.overlaps(
-              sample,
-              trajectoryPoseAtContinuousTime(obstacle, query_time))) {
+              sample, trajectoryPoseAtContinuousTime(obstacle, query_time))) {
         return false;
       }
     }
   }
-  return !checker.collides(end_pose, {}, constraints, arrival_time);
+  // Arrival pose vs. time-point constraints at the arrival step. Dynamic
+  // obstacles at the arrival step are already covered by the fraction == 1.0
+  // sample above.
+  return !checker.collides(end_pose, {}, constraints, depart_time + 1);
 }
 
-// FIX (BUG 4 — O(T) departure scan per transition):
-// When there are no dynamic obstacles the motion along a primitive is either
-// always safe or always blocked (only static geometry matters). In that case
-// the first candidate departure time is sufficient — we just check once and
-// return immediately without scanning the entire window.
-// When dynamic obstacles are present we still scan, but we only go as far as
-// depart_hi (already bounded by the safe intervals), and we stop as soon as we
-// find the first safe departure. In practice this window is small (a few steps)
-// for most cells that are not at a crossing of two agents' paths.
+// Finds the earliest integer departure time in [depart_lo, depart_hi] for
+// which the transition is safe. When the environment is static, transition
+// safety is time-independent, so a single probe at depart_lo suffices.
 int findEarliestSafeDeparture(
     const Pose& start_pose,
     const Pose& end_pose,
     const Primitive& primitive,
     int depart_lo,
     int depart_hi,
+    bool has_dynamic_info,
     const Instance& instance,
     const PlannerConfig& planner_config,
     const CollisionChecker& checker,
     const std::vector<Trajectory>& dynamic_obstacles,
     const ConstraintSet& constraints) {
-  if (dynamic_obstacles.empty() && constraints.empty()) {
-    // Static-only: the transition safety is time-independent.  A single check
-    // at depart_lo is sufficient; if it fails, no later departure will help.
-    if (transitionIsSafe(
-            start_pose,
-            end_pose,
-            primitive,
-            depart_lo,
-            depart_lo + 1,
-            instance,
-            planner_config,
-            checker,
-            dynamic_obstacles,
-            constraints)) {
-      return depart_lo;
-    }
+  if (depart_lo > depart_hi) {
     return -1;
+  }
+  if (!has_dynamic_info) {
+    return transitionIsSafe(
+               start_pose, end_pose, primitive, depart_lo, instance,
+               planner_config, checker, dynamic_obstacles, constraints)
+               ? depart_lo
+               : -1;
   }
   for (int depart = depart_lo; depart <= depart_hi; ++depart) {
     if (transitionIsSafe(
-            start_pose,
-            end_pose,
-            primitive,
-            depart,
-            depart + 1,
-            instance,
-            planner_config,
-            checker,
-            dynamic_obstacles,
-            constraints)) {
+            start_pose, end_pose, primitive, depart, instance, planner_config,
+            checker, dynamic_obstacles, constraints)) {
       return depart;
     }
   }
   return -1;
 }
 
-// SIPP nodes only record motion at departure/arrival times, so fill in
-// the waiting steps in between so the trajectory has an entry for every
-// integer time step.
+// ---------------------------------------------------------------------------
+// Goal validity: the goal must be collision-free from the arrival step all
+// the way to the end of the horizon, otherwise a later obstacle would force
+// the parked agent to move. This forward scan matches HybridAStarPlanner's
+// primitiveKeepsGoalSafe semantics and, unlike a pre-computed interval test,
+// is robust to an earlier agent transiently crossing the goal cell (such a
+// crossing splits the goal cell's interval list so no single interval reaches
+// the horizon, even though the goal is genuinely clear from arrival onward).
+// ---------------------------------------------------------------------------
+
+bool goalIsClearFromArrival(
+    const Pose& goal_pose,
+    int arrival_time,
+    const Instance& instance,
+    const CollisionChecker& checker,
+    const std::vector<Trajectory>& dynamic_obstacles,
+    const ConstraintSet& constraints) {
+  for (int t = arrival_time; t <= instance.vehicle.max_time_steps; ++t) {
+    if (checker.collides(goal_pose, dynamic_obstacles, constraints, t)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Trajectory reconstruction. SIPP nodes record motion only at departure /
+// arrival times, so the waiting steps in between are filled in (the agent
+// holds its pose) to produce one trajectory point per integer time step --
+// the dense format the rest of the system expects.
+// ---------------------------------------------------------------------------
+
 Trajectory reconstructTrajectory(
-    const std::vector<SearchNode>& nodes,
-    int goal_index) {
+    const std::vector<SearchNode>& nodes, int goal_index) {
   Trajectory sparse;
   for (int current = goal_index; current >= 0;
        current = nodes[current].parent_index) {
-    sparse.push_back(TrajectoryPoint{
-        nodes[current].arrival_time,
-        nodes[current].pose,
-    });
+    sparse.push_back(
+        TrajectoryPoint{nodes[current].arrival_time, nodes[current].pose});
   }
   std::reverse(sparse.begin(), sparse.end());
 
   Trajectory dense;
-  dense.reserve(sparse.size());
+  if (!sparse.empty()) {
+    dense.reserve(static_cast<std::size_t>(sparse.back().t) + 1);
+  }
   for (std::size_t i = 0; i < sparse.size(); ++i) {
     if (i > 0) {
       const TrajectoryPoint& previous = sparse[i - 1];
@@ -668,6 +699,20 @@ PlanResult finalizePlanResult(
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// SippPlanner::plan
+//
+// Safe-Interval Path Planning over the Hybrid-A* continuous state space.
+//
+// The search state is (cell, safe-interval). For each motion primitive and
+// each safe interval of the resulting successor cell, the planner generates
+// AT MOST ONE successor node, representing "wait in the current cell as long
+// as necessary, then execute the primitive so as to arrive in that interval
+// as early as possible". Waiting therefore costs no extra nodes -- this is
+// what gives SIPP its expanded-states advantage over a Hybrid A* that must
+// spend one node per waited time step.
+// ---------------------------------------------------------------------------
 
 PlanResult SippPlanner::plan(
     const Pose& start,
@@ -697,8 +742,22 @@ PlanResult SippPlanner::plan(
   const std::vector<std::vector<const Constraint*>> constraints_by_time =
       bucketConstraintsByTime(constraints, instance.vehicle.max_time_steps);
 
-  // FIX: SafeIntervalTable now takes no pose argument in its query — it derives
-  // the canonical cell-centre pose internally from the CellKey.
+  bool has_dynamic_info = false;
+  for (const ObstacleSnapshot& snapshot : obstacle_snapshots) {
+    if (snapshot.active) {
+      has_dynamic_info = true;
+      break;
+    }
+  }
+  if (!has_dynamic_info) {
+    for (const auto& bucket : constraints_by_time) {
+      if (!bucket.empty()) {
+        has_dynamic_info = true;
+        break;
+      }
+    }
+  }
+
   SafeIntervalTable intervals(
       instance, checker, obstacle_snapshots, constraints_by_time);
 
@@ -714,22 +773,21 @@ PlanResult SippPlanner::plan(
   std::vector<SearchNode> nodes;
   nodes.reserve(kSearchReserveHint);
 
-  // FIX (BUG 3): best_costs stores g as arrival_time (integer). This makes the
-  // dominance check exact (no floating-point ambiguity) and consistent with the
-  // heuristic which is also in time-step units.
+  // best_costs maps (cell, interval) -> best known arrival time (integer).
+  // Integer keys make the dominance check exact.
   std::unordered_map<StateKey, int, StateKeyHash> best_costs;
   best_costs.reserve(kSearchReserveHint);
 
   const double start_h = heuristic(start, goal, instance.vehicle.step_size);
   nodes.push_back(SearchNode{
       start,
-      0,                    // arrival_time
-      start_interval_index,
-      0,                    // g_cost = arrival_time = 0
-      start_h,              // f_cost
-      -1,
+      0,                     // arrival_time
+      start_interval_index,  // interval_index
+      start_cell,            // cell
+      start_h,               // f_cost (g = 0)
+      -1,                    // parent_index
   });
-  open.push(OpenEntry{start_h, 0});
+  open.push(OpenEntry{start_h, 0, 0});
   best_costs.emplace(StateKey{start_cell, start_interval_index}, 0);
 
   while (!open.empty()) {
@@ -737,33 +795,27 @@ PlanResult SippPlanner::plan(
     open.pop();
 
     const SearchNode current = nodes[current_entry.node_index];
-    const CellKey current_cell = makeCellKey(current.pose, instance);
-    const StateKey current_key{current_cell, current.interval_index};
+    const StateKey current_key{current.cell, current.interval_index};
 
-    // Stale-node check: skip if a better path to this (cell, interval) was
-    // already found and expanded.
+    // Stale-node check: skip if a strictly better path to this (cell,
+    // interval) was already settled.
     const auto best_it = best_costs.find(current_key);
-    if (best_it == best_costs.end() ||
-        current.g_cost > best_it->second) {
+    if (best_it == best_costs.end() || current.arrival_time > best_it->second) {
       continue;
     }
 
     const std::vector<SafeInterval>& cur_intervals =
-        intervals.intervals(current_cell, current.pose);
+        intervals.intervals(current.cell, current.pose);
+    if (current.interval_index >=
+        static_cast<int>(cur_intervals.size())) {
+      // Defensive: the interval list is path-independent, so this should not
+      // happen, but guard against an out-of-range index rather than risk UB.
+      continue;
+    }
     const SafeInterval cur_interval = cur_intervals[current.interval_index];
 
-    // Goal check: the agent has reached the goal pose AND the goal is
-    // collision-free from arrival_time to max_time_steps (i.e. no future
-    // obstacle will displace the agent from its parking spot).
-    //
-    // FIX (transient-crossing bug): the previous check used
-    //   cur_interval.hi >= max_time_steps
-    // which fails when any prior agent transiently crosses the goal cell.
-    // That crossing splits the pre-computed safe interval, so even though
-    // the goal is completely clear at the actual arrival time, no interval
-    // reaches max_time_steps and the goal check never fires.
-    // goalIsClearFromArrival does a direct forward scan from arrival_time,
-    // matching HybridAStarPlanner::primitiveKeepsGoalSafe exactly.
+    // Goal test: the agent is at the goal pose AND the goal stays clear from
+    // the arrival step to the end of the horizon.
     if (goalReached(current.pose, goal, planner_config) &&
         goalIsClearFromArrival(
             current.pose,
@@ -788,20 +840,23 @@ PlanResult SippPlanner::plan(
     }
     ++stats.expanded_states;
 
+    // The agent may wait in the current cell anywhere within its current
+    // safe interval. The latest it can still depart is bounded by the
+    // interval's upper edge and by the planning horizon.
+    const int latest_depart = std::min(
+        cur_interval.hi, instance.vehicle.max_time_steps - 1);
+
     for (const Primitive& primitive : kPrimitives) {
-      const Pose next_pose = integrateMotion(
+      const Pose next_pose = integratePrimitive(
           current.pose,
           primitive.direction,
           primitive.steer,
           instance.vehicle,
-          instance.vehicle.step_size);
+          1.0);
 
-      // Static collision check on the actual successor pose, matching
-      // HybridAStarPlanner's own successor filtering. This must happen
-      // before querying the interval table: without it, the fallback path
-      // in SafeIntervalTable::intervals() (centre blocked → use actual_pose)
-      // would compute intervals for poses that are genuinely in collision,
-      // creating phantom free cells and exploding the search space.
+      // Reject successors that are in static collision before touching the
+      // interval table -- a statically-blocked cell has no intervals and
+      // would only waste a cache slot.
       if (checker.collides(next_pose)) {
         continue;
       }
@@ -813,18 +868,13 @@ PlanResult SippPlanner::plan(
       for (std::size_t k = 0; k < next_intervals.size(); ++k) {
         const SafeInterval& next_interval = next_intervals[k];
 
-        // Departure window: the agent may wait at current_cell from
-        // current.arrival_time up to cur_interval.hi before moving.
-        // It departs at time T and arrives at T+1, which must land
-        // inside next_interval.
+        // The primitive takes one time step: depart at T, arrive at T + 1.
+        // The arrival T + 1 must land inside next_interval, so the feasible
+        // departure window is the current interval intersected with the
+        // (shifted-back) successor interval and the horizon.
         const int depart_lo =
             std::max(current.arrival_time, next_interval.lo - 1);
-        // FIX (BUG 4 / minor): also cap depart_hi at max_time_steps - 1 so
-        // we never generate a successor node beyond the planning horizon.
-        const int depart_hi = std::min(
-            {cur_interval.hi,
-             next_interval.hi - 1,
-             instance.vehicle.max_time_steps - 1});
+        const int depart_hi = std::min(latest_depart, next_interval.hi - 1);
         if (depart_lo > depart_hi) {
           continue;
         }
@@ -835,6 +885,7 @@ PlanResult SippPlanner::plan(
             primitive,
             depart_lo,
             depart_hi,
+            has_dynamic_info,
             instance,
             planner_config,
             checker,
@@ -845,28 +896,27 @@ PlanResult SippPlanner::plan(
         }
 
         const int arrival = depart + 1;
-        // FIX (BUG 3): g_cost is arrival_time, not arrival_time * step_size.
-        const int new_g = arrival;
         const StateKey next_key{next_cell, static_cast<int>(k)};
         const auto existing = best_costs.find(next_key);
-        if (existing != best_costs.end() && new_g >= existing->second) {
+        if (existing != best_costs.end() && arrival >= existing->second) {
           continue;
         }
+        best_costs[next_key] = arrival;
 
-        best_costs[next_key] = new_g;
         const double new_f =
-            static_cast<double>(new_g) +
+            static_cast<double>(arrival) +
             heuristic(next_pose, goal, instance.vehicle.step_size);
 
         nodes.push_back(SearchNode{
             next_pose,
             arrival,
             static_cast<int>(k),
-            new_g,
+            next_cell,
             new_f,
             current_entry.node_index,
         });
-        open.push(OpenEntry{new_f, static_cast<int>(nodes.size() - 1)});
+        open.push(OpenEntry{
+            new_f, arrival, static_cast<int>(nodes.size() - 1)});
       }
     }
   }
