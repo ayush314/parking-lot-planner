@@ -1,6 +1,7 @@
 #pragma once
 
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -111,6 +112,7 @@ struct Solution {
 class CollisionChecker {
  public:
   explicit CollisionChecker(const Instance& instance);
+  ~CollisionChecker();
 
   bool collides(const Pose& pose) const;
   bool collides(
@@ -121,7 +123,14 @@ class CollisionChecker {
   bool overlaps(const Pose& lhs, const Pose& rhs) const;
 
  private:
+  // Precomputed, immutable view of the static environment (parked-car
+  // oriented boxes + their axis-aligned bounding boxes for broad-phase
+  // culling). Defined in geometry.cpp; held by pointer so the heavy
+  // footprint trig runs once per instance instead of once per query.
+  struct StaticIndex;
+
   const Instance& instance_;
+  std::unique_ptr<StaticIndex> static_index_;
 };
 
 class LowLevelPlanner {
