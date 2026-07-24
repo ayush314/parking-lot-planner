@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build parking_lot_planner (Debug)",
+      "type": "shell",
+      "command": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build --target parking_lot_planner",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    }
+  ]
+}

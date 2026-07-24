@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run planner + export GIF",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/bin/bash",
+      "args": [
+        "-lc",
+        "${workspaceFolder}/build/parking_lot_planner ${workspaceFolder}/build/sipp_five.yaml ${workspaceFolder}/build/sipp_dbug.json"
+      ],
+      "cwd": "${workspaceFolder}",
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "Build parking_lot_planner (Debug)"
+    }
+  ]
+}
+
+// && ${workspaceFolder}/.venv/bin/python ${workspaceFolder}/scripts/visualize_parking.py ${workspaceFolder}/examples/parking_benchmark.yaml ${workspaceFolder}/build/parking_benchmark_output.json --animate --fps 6 --output ${workspaceFolder}/build/parking_benchmark.gif

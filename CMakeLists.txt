@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.5)
 
 project(parking_lot_planner LANGUAGES CXX)
 
@@ -25,6 +25,7 @@ add_library(
   parking_lot_core
   src/planner.cpp
   src/geometry.cpp
+  src/sipp.cpp
   src/io.cpp
 )
 
@@ -37,6 +38,21 @@ target_include_directories(
 target_link_libraries(parking_lot_core PUBLIC yaml-cpp)
 
 target_compile_features(parking_lot_core PUBLIC cxx_std_17)
+
+# Collision-checking ablation toggles (all default ON = fully optimized).
+# Each optimization can be independently disabled at configure time to measure
+# its impact, e.g.:
+#   cmake -DPLP_OPT_UNIT_AXIS=0 -DPLP_OPT_PRECOMPUTE=0 -DPLP_OPT_BROADPHASE=0 ..
+set(PLP_OPT_UNIT_AXIS 1 CACHE STRING "Unit-axis SAT (no sqrt): 1 on, 0 off")
+set(PLP_OPT_PRECOMPUTE 1 CACHE STRING "Precompute static footprints: 1 on, 0 off")
+set(PLP_OPT_BROADPHASE 1 CACHE STRING "Broad-phase AABB reject: 1 on, 0 off")
+target_compile_definitions(
+  parking_lot_core
+  PRIVATE
+    PLP_OPT_UNIT_AXIS=${PLP_OPT_UNIT_AXIS}
+    PLP_OPT_PRECOMPUTE=${PLP_OPT_PRECOMPUTE}
+    PLP_OPT_BROADPHASE=${PLP_OPT_BROADPHASE}
+)
 
 add_executable(parking_lot_planner src/main.cpp)
 target_link_libraries(parking_lot_planner PRIVATE parking_lot_core)
